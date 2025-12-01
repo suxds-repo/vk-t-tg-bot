@@ -7,16 +7,25 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 import vk_api
 
-from telegram import Bot, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from fastapi import FastAPI, Request
+from telegram import (
+    Bot,
+    InputMediaPhoto,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     ContextTypes,
-    CallbackQueryHandler
+    AIORateLimiter,
 )
 
-# ------------ ENV ------------------
 load_dotenv()
 
+# ---------------- ENV -------------------
 VK_TOKEN = os.getenv("VK_TOKEN")
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))
 
@@ -25,8 +34,9 @@ TG_CHANNEL = os.getenv("TG_CHANNEL")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
 
-# ------------ DB -------------------
+# ---------------- DB -------------------
 conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 cursor = conn.cursor()
 
@@ -39,15 +49,16 @@ CREATE TABLE IF NOT EXISTS vk_posts_hashes (
 """)
 conn.commit()
 
-# ------------ CLIENTS -------------
+# ---------------- CLIENTS -------------
 vk = vk_api.VkApi(token=VK_TOKEN)
-bot = Bot(token=TG_BOT_TOKEN)
+bot = Bot(TG_BOT_TOKEN)
+
+# ---------------- FASTAPI APP ----------
+app = FastAPI()
 
 
 # ------------------- UTILS -------------------
-
 def should_post(post):
-    """Фильтр: исключаем закреп, рекламу, репосты"""
     if post.get("is_pinned") == 1:
         return False
     if post.get("marked_as_ads") == 1:
@@ -58,8 +69,8 @@ def should_post(post):
 
 
 def get_latest_valid_post():
-    wall = vk.method('wall.get', {'owner_id': VK_GROUP_ID, 'count': 5})
-    for post in wall.get('items', []):
+    wall = vk.method("wall.get", {"owner_id": VK_GROUP_ID, "count": 5})
+    for post in wall.get("items", []):
         if should_post(post):
             return post
     return None
@@ -94,7 +105,7 @@ def is_post_new_or_changed(post):
     if not row:
         cursor.execute(
             "INSERT INTO vk_posts_hashes (post_id, hash) VALUES (%s, %s)",
-            (post_id, new_hash)
+            (post_id, new_hash),
         )
         conn.commit()
         return True
@@ -102,7 +113,7 @@ def is_post_new_or_changed(post):
     if row["hash"] != new_hash:
         cursor.execute(
             "UPDATE vk_posts_hashes SET hash=%s, updated_at=NOW() WHERE post_id=%s",
-            (new_hash, post_id)
+            (new_hash, post_id),
         )
         conn.commit()
         return True
@@ -110,10 +121,8 @@ def is_post_new_or_changed(post):
     return False
 
 
-# ------------------- MAIN CHECK LOGIC -------------------
-
+# ------------------- CRON CHECK -------------------
 async def send_post_for_confirmation(post):
-    """Отправляет пост админу на подтверждение — можно вызывать из CRON"""
     text = post.get("text", "")
     media = []
 
@@ -127,27 +136,35 @@ async def send_post_for_confirmation(post):
             else:
                 media.append(InputMediaPhoto(photo_bytes))
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Опубликовать", callback_data=f"publish_{post['id']}"),
-        InlineKeyboardButton("Пропустить", callback_data=f"skip_{post['id']}")
-    ]])
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Опубликовать", callback_data=f"publish_{post['id']}"
+                ),
+                InlineKeyboardButton("Пропустить", callback_data=f"skip_{post['id']}"),
+            ]
+        ]
+    )
 
     if media:
-        await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media)
-        await bot.send_message(chat_id=ADMIN_CHAT_ID, text="Опубликовать?", reply_markup=keyboard)
+        await bot.send_media_group(ADMIN_CHAT_ID, media)
+        await bot.send_message(
+            ADMIN_CHAT_ID, "Опубликовать?", reply_markup=keyboard
+        )
     else:
-        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, reply_markup=keyboard)
+        await bot.send_message(
+            ADMIN_CHAT_ID, text, reply_markup=keyboard
+        )
 
 
 async def check_vk_posts():
-    """Эта функция вызывается через CRON (из server.py)"""
     post = get_latest_valid_post()
     if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post)
 
 
-# ------------------- TELEGRAM CALLBACKS -------------------
-
+# -------------- TELEGRAM BUTTON HANDLER -------------
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -155,9 +172,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, post_id = query.data.split("_")
     post_id = int(post_id)
 
-    wall = vk.method('wall.get', {'owner_id': VK_GROUP_ID, 'count': 5})
-
+    wall = vk.method("wall.get", {"owner_id": VK_GROUP_ID, "count": 5})
     post = next((p for p in wall["items"] if p["id"] == post_id), None)
+
     if not post:
         await query.edit_message_text("Не удалось найти пост.")
         return
@@ -177,26 +194,46 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     media.append(InputMediaPhoto(photo_bytes))
 
         if media:
-            await bot.send_media_group(chat_id=TG_CHANNEL, media=media)
-        elif text:
-            await bot.send_message(chat_id=TG_CHANNEL, text=text)
+            await bot.send_media_group(TG_CHANNEL, media)
+        else:
+            await bot.send_message(TG_CHANNEL, text)
 
         await query.edit_message_text("Пост опубликован!")
     else:
         await query.edit_message_text("Пост пропущен.")
 
 
-# ------------------- LOCAL BOT START -------------------
-
-def start_bot_polling():
-    """Ты запускаешь это только локально: python bot.py"""
-    app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    print("Bot polling started…")
-    app.run_polling()
+# ----------------- TELEGRAM WEBHOOK -----------------
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot)
+    await application.update_queue.put(update)
+    return {"ok": True}
 
 
-if __name__ == "__main__":
-    # запуск локально
-    start_bot_polling()
+# ----------------- CRON ENDPOINT --------------------
+@app.get("/check")
+async def cron_check():
+    await check_vk_posts()
+    return {"status": "ok"}
+
+
+# ----------------- START TELEGRAM BOT ----------------
+application = (
+    ApplicationBuilder()
+    .token(TG_BOT_TOKEN)
+    .rate_limiter(AIORateLimiter())
+    .build()
+)
+
+application.add_handler(CallbackQueryHandler(button_callback))
+
+
+@app.on_event("startup")
+async def startup():
+    print("Setting webhook...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(WEBHOOK_URL)
+
+
