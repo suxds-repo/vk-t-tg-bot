@@ -1,18 +1,14 @@
 import os
 import io
 import hashlib
-import requests
+import aiohttp
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 import vk_api
 
 from telegram import Bot, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CallbackQueryHandler
-)
+from telegram.ext import CallbackQueryHandler, Application
 
 # ------------ ENV ------------------
 load_dotenv()
@@ -43,8 +39,7 @@ conn.commit()
 vk = vk_api.VkApi(token=VK_TOKEN)
 bot = Bot(token=TG_BOT_TOKEN)
 
-
-# ------------------- UTILS -------------------
+# ------------ UTILS ----------------
 
 def should_post(post):
     """Фильтр: исключаем закреп, рекламу, репосты"""
@@ -56,7 +51,6 @@ def should_post(post):
         return False
     return True
 
-
 def get_latest_valid_post():
     wall = vk.method('wall.get', {'owner_id': VK_GROUP_ID, 'count': 5})
     for post in wall.get('items', []):
@@ -64,12 +58,11 @@ def get_latest_valid_post():
             return post
     return None
 
-
-def download_photo_bytes(url):
-    r = requests.get(url)
-    r.raise_for_status()
-    return io.BytesIO(r.content)
-
+async def download_photo_bytes(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            return io.BytesIO(await resp.read())
 
 def get_post_hash(post):
     text = post.get("text", "")
@@ -82,7 +75,6 @@ def get_post_hash(post):
 
     full = text + "".join(photos)
     return hashlib.md5(full.encode()).hexdigest()
-
 
 def is_post_new_or_changed(post):
     post_id = str(post["id"])
@@ -109,25 +101,21 @@ def is_post_new_or_changed(post):
 
     return False
 
-
-# ------------------- MAIN CHECK LOGIC -------------------
+# ------------------- MAIN LOGIC -------------------
 
 async def send_post_for_confirmation(post):
-    """Отправляет пост админу на подтверждение — можно вызывать из CRON"""
+    """Отправляет пост админу на подтверждение"""
     text = post.get("text", "")
     media = []
 
     for i, att in enumerate(post.get("attachments", [])):
         if att["type"] == "photo":
             largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
-            photo_bytes = download_photo_bytes(largest["url"])
+            photo_bytes = await download_photo_bytes(largest["url"])
+            caption = text[:1024] if i == 0 else None
+            media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
-            if i == 0:
-                media.append(InputMediaPhoto(photo_bytes, caption=text))
-            else:
-                media.append(InputMediaPhoto(photo_bytes))
-
-    keyboard = InlineKeyboardMarkup([[
+    keyboard = InlineKeyboardMarkup([[ 
         InlineKeyboardButton("Опубликовать", callback_data=f"publish_{post['id']}"),
         InlineKeyboardButton("Пропустить", callback_data=f"skip_{post['id']}")
     ]])
@@ -138,17 +126,15 @@ async def send_post_for_confirmation(post):
     else:
         await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, reply_markup=keyboard)
 
-
 async def check_vk_posts():
-    """Эта функция вызывается через CRON (из server.py)"""
+    """Проверяет новые посты VK и отправляет на подтверждение"""
     post = get_latest_valid_post()
     if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post)
 
+# ------------------- TELEGRAM CALLBACK -------------------
 
-# ------------------- TELEGRAM CALLBACKS -------------------
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
 
@@ -156,47 +142,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post_id = int(post_id)
 
     wall = vk.method('wall.get', {'owner_id': VK_GROUP_ID, 'count': 5})
-
     post = next((p for p in wall["items"] if p["id"] == post_id), None)
     if not post:
         await query.edit_message_text("Не удалось найти пост.")
         return
 
+    text = post.get("text", "")
+    media = []
+
+    for i, att in enumerate(post.get("attachments", [])):
+        if att["type"] == "photo":
+            largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
+            photo_bytes = await download_photo_bytes(largest["url"])
+            caption = text[:1024] if i == 0 else None
+            media.append(InputMediaPhoto(photo_bytes, caption=caption))
+
     if action == "publish":
-        text = post.get("text", "")
-        media = []
-
-        for i, att in enumerate(post.get("attachments", [])):
-            if att["type"] == "photo":
-                largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
-                photo_bytes = download_photo_bytes(largest["url"])
-
-                if i == 0:
-                    media.append(InputMediaPhoto(photo_bytes, caption=text))
-                else:
-                    media.append(InputMediaPhoto(photo_bytes))
-
         if media:
             await bot.send_media_group(chat_id=TG_CHANNEL, media=media)
         elif text:
             await bot.send_message(chat_id=TG_CHANNEL, text=text)
-
         await query.edit_message_text("Пост опубликован!")
     else:
         await query.edit_message_text("Пост пропущен.")
 
+# ------------------- TELEGRAM APPLICATION -------------------
 
-# ------------------- LOCAL BOT START -------------------
-
-def start_bot_polling():
-    """Ты запускаешь это только локально: python bot.py"""
-    app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
+def get_telegram_app():
+    app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
-
-    print("Bot polling started…")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    # запуск локально
-    start_bot_polling()
+    return app
