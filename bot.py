@@ -26,10 +26,20 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 cursor = conn.cursor()
 
+# Таблица для хэшей
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS vk_posts_hashes (
     post_id TEXT PRIMARY KEY,
     hash TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+# Таблица для хранения постов
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS vk_posts (
+    post_id TEXT PRIMARY KEY,
+    text TEXT,
+    photos TEXT[],
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
@@ -101,21 +111,31 @@ def is_post_new_or_changed(post):
 
     return False
 
-# ------------------- MAIN LOGIC -------------------
+# ------------------- MAIN LOGIC ----------------
 
 async def send_post_for_confirmation(post):
     """Отправляет пост админу на подтверждение"""
     text = post.get("text", "")
+    photos = [max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
+              for att in post.get("attachments", []) if att["type"] == "photo"]
+
+    # Сохраняем пост в БД
+    cursor.execute("""
+        INSERT INTO vk_posts (post_id, text, photos)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (post_id) DO UPDATE
+        SET text = EXCLUDED.text, photos = EXCLUDED.photos, updated_at = NOW()
+    """, (str(post["id"]), text, photos))
+    conn.commit()
+
+    # Формируем медиа для админа
     media = []
+    for i, url in enumerate(photos):
+        photo_bytes = await download_photo_bytes(url)
+        caption = text[:1024] if i == 0 else None
+        media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
-    for i, att in enumerate(post.get("attachments", [])):
-        if att["type"] == "photo":
-            largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
-            photo_bytes = await download_photo_bytes(largest["url"])
-            caption = text[:1024] if i == 0 else None
-            media.append(InputMediaPhoto(photo_bytes, caption=caption))
-
-    keyboard = InlineKeyboardMarkup([[ 
+    keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Опубликовать", callback_data=f"publish_{post['id']}"),
         InlineKeyboardButton("Пропустить", callback_data=f"skip_{post['id']}")
     ]])
@@ -132,30 +152,29 @@ async def check_vk_posts():
     if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post)
 
-# ------------------- TELEGRAM CALLBACK -------------------
+# ------------------- TELEGRAM CALLBACK ----------------
 
 async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
 
     action, post_id = query.data.split("_")
-    post_id = int(post_id)
+    post_id = str(post_id)
 
-    wall = vk.method('wall.get', {'owner_id': VK_GROUP_ID, 'count': 5})
-    post = next((p for p in wall["items"] if p["id"] == post_id), None)
-    if not post:
-        await query.edit_message_text("Не удалось найти пост.")
+    # Берём пост из БД
+    cursor.execute("SELECT text, photos FROM vk_posts WHERE post_id = %s", (post_id,))
+    row = cursor.fetchone()
+    if not row:
+        await query.edit_message_text("Не удалось найти пост в БД.")
         return
 
-    text = post.get("text", "")
+    text = row["text"]
+    photos_urls = row["photos"] or []
     media = []
-
-    for i, att in enumerate(post.get("attachments", [])):
-        if att["type"] == "photo":
-            largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
-            photo_bytes = await download_photo_bytes(largest["url"])
-            caption = text[:1024] if i == 0 else None
-            media.append(InputMediaPhoto(photo_bytes, caption=caption))
+    for i, url in enumerate(photos_urls):
+        photo_bytes = await download_photo_bytes(url)
+        caption = text[:1024] if i == 0 else None
+        media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
     if action == "publish":
         if media:
@@ -166,7 +185,7 @@ async def button_callback(update: Update, context):
     else:
         await query.edit_message_text("Пост пропущен.")
 
-# ------------------- TELEGRAM APPLICATION -------------------
+# ------------------- TELEGRAM APPLICATION ----------------
 
 def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
