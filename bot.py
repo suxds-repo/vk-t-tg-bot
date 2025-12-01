@@ -1,230 +1,208 @@
 import os
-import time
+import io
 import hashlib
-import requests
+import aiohttp
 import psycopg2
-from datetime import datetime
-from telegram import Bot
-from telegram.constants import ParseMode
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+import vk_api
 
+from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, Application
+
+# ------------ ENV ------------------
 load_dotenv()
 
-# -----------------------------------------
-#  Настройки
-# -----------------------------------------
-VK_API_URL = "https://api.vk.com/method/wall.get"
-VK_GROUP_ID = "-224038468"
-VK_API_VERSION = "5.154"
-MAX_POSTS = 20
+VK_TOKEN = os.getenv("VK_TOKEN")
+VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))
 
-# -----------------------------------------
-#  Получение переменных окружения
-# -----------------------------------------
-vk_access_token = os.getenv("VK_ACCESS_TOKEN")
-bot_token = os.getenv("BOT_TOKEN")
-chat_id = os.getenv("CHAT_ID")  # telegram chat id
-db_url = os.getenv("DATABASE_URL")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHANNEL = os.getenv("TG_CHANNEL")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 
-if not all([vk_access_token, bot_token, chat_id, db_url]):
-    raise ValueError("❌ Не найдены переменные окружения! Проверь .env")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# -----------------------------------------
-#  Подключение к базе
-# -----------------------------------------
-try:
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
-except Exception as e:
-    print("❌ Ошибка подключения к БД:", e)
-    exit()
+# ------------ DB -------------------
+conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+cursor = conn.cursor()
 
-# -----------------------------------------
-#  Проверка и создание таблиц
-# -----------------------------------------
+# Таблица для хэшей
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS vk_posts (
-        post_id BIGINT PRIMARY KEY,
-        text TEXT,
-        photos TEXT[],
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
+CREATE TABLE IF NOT EXISTS vk_posts_hashes (
+    post_id TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
 """)
-
+# Таблица для хранения постов
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS vk_posts_hashes (
-        post_id BIGINT PRIMARY KEY,
-        content_hash TEXT
-    )
+CREATE TABLE IF NOT EXISTS vk_posts (
+    post_id TEXT PRIMARY KEY,
+    text TEXT,
+    photos TEXT[],
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
 """)
-
 conn.commit()
 
-bot = Bot(token=bot_token)
+# ------------ CLIENTS -------------
+vk = vk_api.VkApi(token=VK_TOKEN)
 
-# -----------------------------------------
-#  Функция очистки (исправлена!)
-# -----------------------------------------
+# ------------ UTILS ----------------
+def should_post(post):
+    """Фильтр: исключаем закреп, рекламу, репосты"""
+    if post.get("is_pinned") == 1:
+        return False
+    if post.get("marked_as_ads") == 1:
+        return False
+    if "copy_history" in post:
+        return False
+    return True
+
+def get_latest_valid_post():
+    wall = vk.method('wall.get', {'owner_id': VK_GROUP_ID, 'count': 5})
+    for post in wall.get('items', []):
+        if should_post(post):
+            return post
+    return None
+
+async def download_photo_bytes(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            return io.BytesIO(await resp.read())
+
+def get_post_hash(post):
+    text = post.get("text", "")
+    photos = []
+    for att in post.get("attachments", []):
+        if att["type"] == "photo":
+            largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
+            photos.append(largest["url"])
+    full = text + "".join(photos)
+    return hashlib.md5(full.encode()).hexdigest()
+
+def is_post_new_or_changed(post):
+    post_id = str(post["id"])
+    new_hash = get_post_hash(post)
+    cursor.execute("SELECT hash FROM vk_posts_hashes WHERE post_id=%s", (post_id,))
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute(
+            "INSERT INTO vk_posts_hashes (post_id, hash) VALUES (%s, %s)",
+            (post_id, new_hash)
+        )
+        conn.commit()
+        return True
+    if row["hash"] != new_hash:
+        cursor.execute(
+            "UPDATE vk_posts_hashes SET hash=%s, updated_at=NOW() WHERE post_id=%s",
+            (new_hash, post_id)
+        )
+        conn.commit()
+        return True
+    return False
+
+# ------------------- MAIN LOGIC ----------------
+async def send_post_for_confirmation(post, app: Application):
+    """Отправляет пост админу на подтверждение"""
+    text = post.get("text", "")
+    photos = [max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
+              for att in post.get("attachments", []) if att["type"] == "photo"]
+
+    # Сохраняем пост в БД
+    cursor.execute("""
+        INSERT INTO vk_posts (post_id, text, photos)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (post_id) DO UPDATE
+        SET text = EXCLUDED.text, photos = EXCLUDED.photos, updated_at = NOW()
+    """, (str(post["id"]), text, photos))
+    conn.commit()
+
+    # Формируем медиа для админа
+    media = []
+    for i, url in enumerate(photos):
+        photo_bytes = await download_photo_bytes(url)
+        caption = text[:1024] if i == 0 else None
+        media.append(InputMediaPhoto(photo_bytes, caption=caption))
+
+    keyboard = InlineKeyboardMarkup([[ 
+        InlineKeyboardButton("Опубликовать ✅", callback_data=f"publish_{post['id']}"),
+        InlineKeyboardButton("Пропустить ❌", callback_data=f"skip_{post['id']}")
+    ]])
+
+    if media:
+        await app.bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media)
+        await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text="Опубликовать?", reply_markup=keyboard)
+    else:
+        await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, reply_markup=keyboard)
+
+MAX_POSTS = 20  # оставляем только последние 20 постов
+
 def clean_old_posts():
+    # Удаляем старые посты из vk_posts
     cursor.execute("""
         DELETE FROM vk_posts
         WHERE post_id NOT IN (
-            SELECT post_id FROM vk_posts ORDER BY updated_at DESC LIMIT %s
+            SELECT post_id
+            FROM vk_posts
+            ORDER BY updated_at DESC
+            LIMIT %s
         )
     """, (MAX_POSTS,))
+    
+    # Удаляем соответствующие хэши из vk_posts_hashes
+    cursor.execute("""
+        DELETE FROM vk_posts_hashes
+        WHERE post_id NOT IN (
+            SELECT post_id
+            FROM vk_posts
+        )
+    """)
+    
     conn.commit()
-    print("🧹 Очищены старые записи vk_posts (хэши теперь не трогаем!)")
 
-# -----------------------------------------
-#  Генерация хэша поста
-# -----------------------------------------
-def calculate_post_hash(post):
-    post_id = post.get("id", 0)
-    owner_id = post.get("owner_id", 0)
-    text = post.get("text", "") or ""
-    attachments = post.get("attachments", [])
+async def check_vk_posts(app: Application):
+    """Проверяет новые посты VK и отправляет на подтверждение"""
+    clean_old_posts() 
+    post = get_latest_valid_post()
+    if post and is_post_new_or_changed(post):
+        await send_post_for_confirmation(post, app)
 
-    photos_data = []
-    for attachment in attachments:
-        if attachment["type"] == "photo":
-            photos_data.append(str(attachment["photo"].get("sizes", [])))
+# ------------------- TELEGRAM CALLBACK ----------------
+async def button_callback(update: Update, context):
+    query = update.callback_query
+    await query.answer()
 
-    hash_string = f"{post_id}|{owner_id}|{text}|{'|'.join(photos_data)}"
-    return hashlib.md5(hash_string.encode("utf-8")).hexdigest()
+    action, post_id = query.data.split("_")
+    post_id = str(post_id)
 
-# -----------------------------------------
-#  Получение медиаконтента
-# -----------------------------------------
-def get_post_media(post):
+    cursor.execute("SELECT text, photos FROM vk_posts WHERE post_id = %s", (post_id,))
+    row = cursor.fetchone()
+    if not row:
+        await query.edit_message_text("Не удалось найти пост в БД.")
+        return
+
+    text = row["text"]
+    photos_urls = row["photos"] or []
     media = []
-    attachments = post.get("attachments", [])
+    for i, url in enumerate(photos_urls):
+        photo_bytes = await download_photo_bytes(url)
+        caption = text[:1024] if i == 0 else None
+        media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
-    for attachment in attachments:
-        if attachment["type"] == "photo":
-            sizes = attachment["photo"].get("sizes", [])
-            if sizes:
-                media.append(max(sizes, key=lambda x: x["width"])["url"])
-    return media
+    if action == "publish":
+        if media:
+            await context.bot.send_media_group(chat_id=TG_CHANNEL, media=media)
+        elif text:
+            await context.bot.send_message(chat_id=TG_CHANNEL, text=text)
+        await query.edit_message_text("Пост опубликован!")
+    else:
+        await query.edit_message_text("Пост пропущен.")
 
-# -----------------------------------------
-#  Проверка URL (фото)
-# -----------------------------------------
-def is_url_valid(url):
-    try:
-        response = requests.head(url, timeout=5)
-        return response.status_code == 200
-    except:
-        return False
+# ------------------- TELEGRAM APPLICATION ----------------
+def get_telegram_app():
+    app = Application.builder().token(TG_BOT_TOKEN).build()
+    app.add_handler(CallbackQueryHandler(button_callback))
+    return app
 
-def validate_photo_urls(photo_urls):
-    return [url for url in photo_urls if is_url_valid(url)]
-
-# -----------------------------------------
-#  Парсинг поста в текст
-# -----------------------------------------
-def parse_vk_post(post):
-    post_text = post.get("text", "") or ""
-    media_urls = get_post_media(post)
-
-    post_link = (
-        f"https://vk.com/wall{post.get('from_id')}_{post.get('id')}"
-    )
-
-    text_content = f"<b>{post_text}</b>\n\n<a href='{post_link}'>Открыть пост ВКонтакте</a>"
-    return text_content, media_urls
-
-# -----------------------------------------
-#  Основная логика обработки
-# -----------------------------------------
-while True:
-    try:
-        response = requests.get(
-            VK_API_URL,
-            params={
-                "access_token": vk_access_token,
-                "owner_id": VK_GROUP_ID,
-                "count": 5,
-                "v": VK_API_VERSION,
-            }
-        ).json()
-
-        if "error" in response:
-            print("⚠ VK API error:", response["error"])
-            time.sleep(10)
-            continue
-
-        posts = response.get("response", {}).get("items", [])
-        if not posts:
-            print("⚠ Нет постов в группе")
-            time.sleep(10)
-            continue
-
-        clean_old_posts()
-
-        for post in posts:
-            post_id = post.get("id", 0)
-            owner_id = post.get("owner_id", 0)
-            combined_id = f"{owner_id}_{post_id}"
-
-            cursor.execute("SELECT content_hash FROM vk_posts_hashes WHERE post_id=%s", (combined_id,))
-            result = cursor.fetchone()
-
-            current_hash = calculate_post_hash(post)
-
-            if result:
-                old_hash = result[0]
-                if old_hash == current_hash:
-                    print(f"↩ Пропущен (без изменений): {combined_id}")
-                    continue
-                else:
-                    print(f"♻ Обновление поста: {combined_id}")
-            else:
-                print(f"🆕 Новый пост: {combined_id}")
-
-            # Парсим
-            try:
-                parsed_text, media_urls = parse_vk_post(post)
-
-                # отправка без фото
-                bot.send_message(
-                    chat_id=chat_id,
-                    text=parsed_text,
-                    parse_mode=ParseMode.HTML
-                )
-                print(f"📨 Отправлен в Telegram post_id={post_id}")
-
-                # Валидируем фото
-                valid_media_urls = validate_photo_urls(media_urls)
-
-                # отправляем фото по каждому валидному URL
-                for url in valid_media_urls:
-                    bot.send_photo(chat_id=chat_id, photo=url)
-
-            except Exception as e:
-                print(f"❌ Ошибка обработки поста: {e}")
-
-            # записываем в БД
-            cursor.execute("""
-                INSERT INTO vk_posts (post_id, text, photos, updated_at)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (post_id) DO UPDATE
-                SET text = EXCLUDED.text,
-                    photos = EXCLUDED.photos,
-                    updated_at = EXCLUDED.updated_at
-            """, (combined_id, post.get("text", ""), media_urls, datetime.now()))
-
-            cursor.execute("""
-                INSERT INTO vk_posts_hashes (post_id, content_hash)
-                VALUES (%s, %s)
-                ON CONFLICT (post_id) DO UPDATE
-                SET content_hash = EXCLUDED.content_hash
-            """, (combined_id, current_hash))
-
-            conn.commit()
-
-        print("⏳ Ожидание 10 секунд...\n")
-        time.sleep(10)
-
-    except Exception as e:
-        print("❌ Глобальная ошибка:", e)
-        time.sleep(5)
