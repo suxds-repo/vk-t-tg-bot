@@ -127,8 +127,8 @@ async def send_post_for_confirmation(post, app: Application):
         media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
     keyboard = InlineKeyboardMarkup([[ 
-        InlineKeyboardButton("Опубликовать", callback_data=f"publish_{post['id']}"),
-        InlineKeyboardButton("Пропустить", callback_data=f"skip_{post['id']}")
+        InlineKeyboardButton("Опубликовать ✅", callback_data=f"publish_{post['id']}"),
+        InlineKeyboardButton("Пропустить ❌", callback_data=f"skip_{post['id']}")
     ]])
 
     if media:
@@ -179,3 +179,4 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
