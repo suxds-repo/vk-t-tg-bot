@@ -137,10 +137,11 @@ async def send_post_for_confirmation(post, app: Application):
     else:
         await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, reply_markup=keyboard)
 
+
 MAX_POSTS = 20  # оставляем только последние 20 постов
 
 def clean_old_posts():
-    # Удаляем старые посты из vk_posts
+    # Удаляем старые посты из vk_posts (только таблицу постов)
     cursor.execute("""
         DELETE FROM vk_posts
         WHERE post_id NOT IN (
@@ -150,17 +151,16 @@ def clean_old_posts():
             LIMIT %s
         )
     """, (MAX_POSTS,))
-    
-    # Удаляем соответствующие хэши из vk_posts_hashes
-    cursor.execute("""
-        DELETE FROM vk_posts_hashes
-        WHERE post_id NOT IN (
-            SELECT post_id
-            FROM vk_posts
-        )
-    """)
-    
+
+    # ХЭШЕЙ НЕ ТРОГАЕМ ⚡
+    #
+    # Даже если vk_posts очищается — vk_posts_hashes
+    # должны хранить хэш ЛЮБОГО поста, который когда-либо был обработан.
+    #
+    # Если удалить хэш → бот решит, что пост "новый" → и пришлёт его снова.
+
     conn.commit()
+
 
 async def check_vk_posts(app: Application):
     """Проверяет новые посты VK и отправляет на подтверждение"""
@@ -205,4 +205,5 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
