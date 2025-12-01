@@ -27,7 +27,7 @@ async def startup():
                 await check_vk_posts()
             except Exception as e:
                 print("VK check error:", e)
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
     create_task(vk_loop())
 
 # ------------------- Webhook endpoint -------------------
