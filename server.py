@@ -1,39 +1,31 @@
-import os
-import requests
+import asyncio
 from fastapi import FastAPI, Request
-from bot import bot, get_telegram_app, check_vk_posts
+from bot import get_telegram_app, check_vk_posts
 
 app = FastAPI()
-
-# ------------------- Telegram Application -------------------
 telegram_app = get_telegram_app()
 
 @app.on_event("startup")
-async def startup():
-    # Инициализация приложения Telegram
-    await telegram_app.initialize()
-
-    # Установка webhook
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # например https://your-app.onrender.com/webhook
-    TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-    requests.get(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}")
-
-    # Запуск VK проверки в фоне
-    from asyncio import create_task
-    async def vk_loop():
-        import asyncio
+async def startup_event():
+    """Запускаем цикл проверки VK постов каждые 5 секунд"""
+    async def loop():
         while True:
             try:
-                await check_vk_posts()
+                await check_vk_posts(telegram_app)
             except Exception as e:
-                print("VK check error:", e)
-            await asyncio.sleep(5)
-    create_task(vk_loop())
-
-# ------------------- Webhook endpoint -------------------
+                print("Ошибка проверки VK:", e)
+            await asyncio.sleep(5)  # 5 секунд
+    asyncio.create_task(loop())
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
+    """Вебхук Telegram"""
     update = await request.json()
-    await telegram_app.process_update(update)
+    from telegram import Update
+    telegram_update = Update.de_json(update, telegram_app.bot)
+    await telegram_app.process_update(telegram_update)
     return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
