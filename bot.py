@@ -153,7 +153,6 @@ async def check_vk_posts():
         await send_post_for_confirmation(post)
 
 # ------------------- TELEGRAM CALLBACK ----------------
-
 async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -178,12 +177,13 @@ async def button_callback(update: Update, context):
 
     if action == "publish":
         if media:
-            await bot.send_media_group(chat_id=TG_CHANNEL, media=media)
+            await context.bot.send_media_group(chat_id=TG_CHANNEL, media=media)
         elif text:
-            await bot.send_message(chat_id=TG_CHANNEL, text=text)
+            await context.bot.send_message(chat_id=TG_CHANNEL, text=text)
         await query.edit_message_text("Пост опубликован!")
     else:
         await query.edit_message_text("Пост пропущен.")
+
 
 # ------------------- TELEGRAM APPLICATION ----------------
 
@@ -191,3 +191,4 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
