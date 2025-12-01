@@ -137,8 +137,34 @@ async def send_post_for_confirmation(post, app: Application):
     else:
         await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, reply_markup=keyboard)
 
+MAX_POSTS = 20  # оставляем только последние 20 постов
+
+def clean_old_posts():
+    # Удаляем старые посты из vk_posts
+    cursor.execute("""
+        DELETE FROM vk_posts
+        WHERE post_id NOT IN (
+            SELECT post_id
+            FROM vk_posts
+            ORDER BY updated_at DESC
+            LIMIT %s
+        )
+    """, (MAX_POSTS,))
+    
+    # Удаляем соответствующие хэши из vk_posts_hashes
+    cursor.execute("""
+        DELETE FROM vk_posts_hashes
+        WHERE post_id NOT IN (
+            SELECT post_id
+            FROM vk_posts
+        )
+    """)
+    
+    conn.commit()
+
 async def check_vk_posts(app: Application):
     """Проверяет новые посты VK и отправляет на подтверждение"""
+    clean_old_posts() 
     post = get_latest_valid_post()
     if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post, app)
@@ -179,4 +205,5 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
