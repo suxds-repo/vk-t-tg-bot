@@ -1,32 +1,47 @@
 import os
 import io
-import json
 import hashlib
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 import vk_api
 from telegram import Bot, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CallbackQueryHandler
 
+# загружаем .env
 load_dotenv()
 
+# VK
 VK_TOKEN = os.getenv("VK_TOKEN")
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))
+
+# Telegram
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHANNEL = os.getenv("TG_CHANNEL")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 
+# PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL")
+conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+cursor = conn.cursor()
+
+# создаём таблицу для хэшей постов, если нет
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS vk_posts_hashes (
+    post_id TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
+
+# VK и Telegram клиенты
 vk = vk_api.VkApi(token=VK_TOKEN)
 bot = Bot(token=TG_BOT_TOKEN)
 
-# словарь для хранения хэшей постов
-POST_HASHES_FILE = "post_hashes.json"
-if os.path.exists(POST_HASHES_FILE):
-    with open(POST_HASHES_FILE, "r") as f:
-        post_hashes = json.load(f)
-else:
-    post_hashes = {}
 
+# ------------------- функции -------------------
 
 def should_post(post):
     """Фильтр: не закреплённые, не реклама, не репосты"""
@@ -65,6 +80,28 @@ def get_post_hash(post):
     return hashlib.md5(full_str.encode("utf-8")).hexdigest()
 
 
+def is_post_new_or_changed(post):
+    """Проверяем, новый ли пост или изменился ли хэш"""
+    post_id = str(post['id'])
+    current_hash = get_post_hash(post)
+
+    cursor.execute("SELECT hash FROM vk_posts_hashes WHERE post_id=%s", (post_id,))
+    result = cursor.fetchone()
+
+    if not result:
+        # новый пост
+        cursor.execute("INSERT INTO vk_posts_hashes(post_id, hash) VALUES (%s, %s)", (post_id, current_hash))
+        conn.commit()
+        return True
+    elif result['hash'] != current_hash:
+        # изменился
+        cursor.execute("UPDATE vk_posts_hashes SET hash=%s, updated_at=NOW() WHERE post_id=%s", (current_hash, post_id))
+        conn.commit()
+        return True
+
+    return False
+
+
 async def send_post_for_confirmation(post, context: ContextTypes.DEFAULT_TYPE):
     """Отправляем пост на подтверждение админу"""
     text = post.get('text', '')
@@ -96,20 +133,8 @@ async def send_post_for_confirmation(post, context: ContextTypes.DEFAULT_TYPE):
 async def check_vk_posts(context: ContextTypes.DEFAULT_TYPE):
     """Проверка последних постов VK"""
     post = get_latest_valid_post()
-    if not post:
-        return
-
-    post_id = str(post['id'])
-    current_hash = get_post_hash(post)
-
-    # если пост новый или изменился — отправляем на подтверждение
-    if post_id not in post_hashes or post_hashes[post_id] != current_hash:
+    if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post, context)
-        post_hashes[post_id] = current_hash
-
-        # сохраняем хэши в файл
-        with open(POST_HASHES_FILE, "w") as f:
-            json.dump(post_hashes, f)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -149,6 +174,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("skip"):
         await query.edit_message_text("Пост пропущен ❌")
 
+
+# ------------------- запуск бота -------------------
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
