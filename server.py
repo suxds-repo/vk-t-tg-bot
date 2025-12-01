@@ -41,6 +41,10 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(telegram_update)
     return {"ok": True}
 
+@app.get("/check_vk")
+async def check_vk_endpoint():
+    await check_vk_posts(telegram_app)  # или функция, которая проверяет и при необходимости шлёт пост
+    return {"status": "ok"}
 
 @app.get("/")
 async def root():
