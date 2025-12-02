@@ -12,3 +12,4 @@ aiohttp
 fastapi-utils
 typing-inspect
 supabase==2.4.3
+httpx
