@@ -104,8 +104,10 @@ def save_post_to_db(post):
     supabase.table("vk_posts").upsert({
         "post_id": post_id,
         "text": text,
-        "photos": photos
+        "photos": photos,
+        "post_hash": get_post_hash(post)   # ← ДОБАВЛЕНО
     }).execute()
+
 
 
 # ------------------- CLEAN OLD POSTS ---------------------
@@ -223,6 +225,7 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
 
 
