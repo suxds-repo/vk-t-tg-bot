@@ -18,7 +18,7 @@ async def startup_event():
     async def vk_loop():
         while True:
             try:
-                await clean_old_hashes()       # ← добавить
+                #await clean_old_hashes()       # ← добавить
                 await check_vk_posts(telegram_app)
             except Exception as e:
                 print("Ошибка проверки VK:", e)
