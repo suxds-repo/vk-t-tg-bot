@@ -178,6 +178,7 @@ async def send_post_for_confirmation(post, app: Application):
 # ------------------- CRON CHECK --------------------------
 async def check_vk_posts(app: Application):
     clean_old_posts()
+    clean_old_hashes()
     post = get_latest_valid_post()
     if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post, app)
@@ -222,5 +223,6 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
 
