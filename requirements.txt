@@ -11,4 +11,6 @@ telegram
 aiohttp
 fastapi-utils
 typing-inspect
-supabase
+supabase==2.4.3
+httpx==0.27.2
+
