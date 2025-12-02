@@ -139,8 +139,6 @@ def clean_old_hashes():
 
     keep_ids = [row["post_id"] for row in latest.data]
 
-    if not keep_ids:
-        return
 
     # Удаляем остальные
     supabase.table("vk_posts_hashes")\
@@ -224,4 +222,5 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
