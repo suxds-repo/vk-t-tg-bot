@@ -2,17 +2,16 @@ import os
 import io
 import hashlib
 import aiohttp
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from dotenv import load_dotenv
 import vk_api
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
 from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, Application
 
-# ------------ ENV ------------------
 load_dotenv()
 
+# ------------ ENV ------------------
 VK_TOKEN = os.getenv("VK_TOKEN")
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))
 
@@ -20,37 +19,17 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHANNEL = os.getenv("TG_CHANNEL")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ------------ DB -------------------
-conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-cursor = conn.cursor()
+# ------------ SUPABASE ------------------
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Таблица для хэшей
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS vk_posts_hashes (
-    post_id TEXT PRIMARY KEY,
-    hash TEXT NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-# Таблица для хранения постов
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS vk_posts (
-    post_id TEXT PRIMARY KEY,
-    text TEXT,
-    photos TEXT[],
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-conn.commit()
-
-# ------------ CLIENTS -------------
+# ------------ VK CLIENT -----------------
 vk = vk_api.VkApi(token=VK_TOKEN)
 
-# ------------ UTILS ----------------
+# ------------ UTILS ---------------------
 def should_post(post):
-    """Фильтр: исключаем закреп, рекламу, репосты"""
     if post.get("is_pinned") == 1:
         return False
     if post.get("marked_as_ads") == 1:
@@ -59,6 +38,7 @@ def should_post(post):
         return False
     return True
 
+
 def get_latest_valid_post():
     wall = vk.method('wall.get', {'owner_id': VK_GROUP_ID, 'count': 5})
     for post in wall.get('items', []):
@@ -66,11 +46,13 @@ def get_latest_valid_post():
             return post
     return None
 
+
 async def download_photo_bytes(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             resp.raise_for_status()
             return io.BytesIO(await resp.read())
+
 
 def get_post_hash(post):
     text = post.get("text", "")
@@ -79,97 +61,112 @@ def get_post_hash(post):
         if att["type"] == "photo":
             largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
             photos.append(largest["url"])
-    full = text + "".join(photos)
-    return hashlib.md5(full.encode()).hexdigest()
+    return hashlib.md5((text + "".join(photos)).encode()).hexdigest()
+
 
 def is_post_new_or_changed(post):
     post_id = str(post["id"])
     new_hash = get_post_hash(post)
-    cursor.execute("SELECT hash FROM vk_posts_hashes WHERE post_id=%s", (post_id,))
-    row = cursor.fetchone()
-    if not row:
-        cursor.execute(
-            "INSERT INTO vk_posts_hashes (post_id, hash) VALUES (%s, %s)",
-            (post_id, new_hash)
-        )
-        conn.commit()
+
+    # SELECT
+    result = supabase.table("vk_posts_hashes").select("hash").eq("post_id", post_id).execute()
+    data = result.data
+
+    if not data:
+        # INSERT
+        supabase.table("vk_posts_hashes").insert({
+            "post_id": post_id,
+            "hash": new_hash
+        }).execute()
         return True
-    if row["hash"] != new_hash:
-        cursor.execute(
-            "UPDATE vk_posts_hashes SET hash=%s, updated_at=NOW() WHERE post_id=%s",
-            (new_hash, post_id)
-        )
-        conn.commit()
+
+    old_hash = data[0]["hash"]
+    if old_hash != new_hash:
+        # UPDATE
+        supabase.table("vk_posts_hashes").update({
+            "hash": new_hash,
+            "updated_at": "now()"
+        }).eq("post_id", post_id).execute()
         return True
+
     return False
 
-# ------------------- MAIN LOGIC ----------------
-async def send_post_for_confirmation(post, app: Application):
-    """Отправляет пост админу на подтверждение"""
+
+# ------------------- SAVE POST --------------------------
+def save_post_to_db(post):
+    post_id = str(post["id"])
     text = post.get("text", "")
-    photos = [max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
-              for att in post.get("attachments", []) if att["type"] == "photo"]
+    photos = [
+        max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
+        for att in post.get("attachments", []) if att["type"] == "photo"
+    ]
 
-    # Сохраняем пост в БД
-    cursor.execute("""
-        INSERT INTO vk_posts (post_id, text, photos)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (post_id) DO UPDATE
-        SET text = EXCLUDED.text, photos = EXCLUDED.photos, updated_at = NOW()
-    """, (str(post["id"]), text, photos))
-    conn.commit()
+    supabase.table("vk_posts").upsert({
+        "post_id": post_id,
+        "text": text,
+        "photos": photos
+    }).execute()
 
-    # Формируем медиа для админа
+
+# ------------------- CLEAN OLD POSTS ---------------------
+MAX_POSTS = 20
+
+def clean_old_posts():
+    # Получаем последние 20 id
+    latest = supabase.table("vk_posts")\
+        .select("post_id")\
+        .order("updated_at", desc=True)\
+        .limit(MAX_POSTS)\
+        .execute()
+
+    keep_ids = [row["post_id"] for row in latest.data]
+
+    # Удаляем остальные
+    supabase.table("vk_posts")\
+        .delete()\
+        .not_.in_("post_id", keep_ids)\
+        .execute()
+
+    # ХЭШИ НЕ ТРОГАЕМ
+
+
+# ------------------- SEND TO ADMIN -----------------------
+async def send_post_for_confirmation(post, app: Application):
+    save_post_to_db(post)
+
+    text = post.get("text", "")
+    photos = [
+        max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
+        for att in post.get("attachments", []) if att["type"] == "photo"
+    ]
+
     media = []
     for i, url in enumerate(photos):
         photo_bytes = await download_photo_bytes(url)
         caption = text[:1024] if i == 0 else None
         media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
-    keyboard = InlineKeyboardMarkup([[ 
+    keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Опубликовать ✅", callback_data=f"publish_{post['id']}"),
         InlineKeyboardButton("Пропустить ❌", callback_data=f"skip_{post['id']}")
     ]])
 
     if media:
-        await app.bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media)
-        await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text="Опубликовать?", reply_markup=keyboard)
+        await app.bot.send_media_group(ADMIN_CHAT_ID, media)
+        await app.bot.send_message(ADMIN_CHAT_ID, "Опубликовать?", reply_markup=keyboard)
     else:
-        await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, reply_markup=keyboard)
+        await app.bot.send_message(ADMIN_CHAT_ID, text, reply_markup=keyboard)
 
 
-MAX_POSTS = 20  # оставляем только последние 20 постов
-
-def clean_old_posts():
-    # Удаляем старые посты из vk_posts (только таблицу постов)
-    cursor.execute("""
-        DELETE FROM vk_posts
-        WHERE post_id NOT IN (
-            SELECT post_id
-            FROM vk_posts
-            ORDER BY updated_at DESC
-            LIMIT %s
-        )
-    """, (MAX_POSTS,))
-
-    # ХЭШЕЙ НЕ ТРОГАЕМ ⚡
-    #
-    # Даже если vk_posts очищается — vk_posts_hashes
-    # должны хранить хэш ЛЮБОГО поста, который когда-либо был обработан.
-    #
-    # Если удалить хэш → бот решит, что пост "новый" → и пришлёт его снова.
-
-    conn.commit()
-
-
+# ------------------- CRON CHECK --------------------------
 async def check_vk_posts(app: Application):
-    """Проверяет новые посты VK и отправляет на подтверждение"""
-    clean_old_posts() 
+    clean_old_posts()
     post = get_latest_valid_post()
     if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post, app)
 
-# ------------------- TELEGRAM CALLBACK ----------------
+
+# ------------------- CALLBACK -----------------------------
 async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -177,33 +174,34 @@ async def button_callback(update: Update, context):
     action, post_id = query.data.split("_")
     post_id = str(post_id)
 
-    cursor.execute("SELECT text, photos FROM vk_posts WHERE post_id = %s", (post_id,))
-    row = cursor.fetchone()
-    if not row:
+    # SELECT
+    row = supabase.table("vk_posts").select("*").eq("post_id", post_id).single().execute()
+
+    if not row.data:
         await query.edit_message_text("Не удалось найти пост в БД.")
         return
 
-    text = row["text"]
-    photos_urls = row["photos"] or []
+    text = row.data.get("text")
+    photos = row.data.get("photos") or []
+
     media = []
-    for i, url in enumerate(photos_urls):
+    for i, url in enumerate(photos):
         photo_bytes = await download_photo_bytes(url)
         caption = text[:1024] if i == 0 else None
         media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
     if action == "publish":
         if media:
-            await context.bot.send_media_group(chat_id=TG_CHANNEL, media=media)
+            await context.bot.send_media_group(TG_CHANNEL, media)
         elif text:
-            await context.bot.send_message(chat_id=TG_CHANNEL, text=text)
+            await context.bot.send_message(TG_CHANNEL, text)
         await query.edit_message_text("Пост опубликован!")
     else:
         await query.edit_message_text("Пост пропущен.")
 
-# ------------------- TELEGRAM APPLICATION ----------------
+
+# ------------------- APP INIT -----------------------------
 def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
-
-
