@@ -46,7 +46,7 @@ async def telegram_webhook(request: Request):
 @app.get("/check_vk")
 async def check_vk_endpoint():
     try:
-        await clean_old_hashes()               # ← добавить
+        await clean_old_hashes()     
         await check_vk_posts(telegram_app)
     except Exception as e:
         print("check_vk endpoint error:", str(e)[:200])
