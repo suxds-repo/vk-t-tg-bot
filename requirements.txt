@@ -11,3 +11,4 @@ telegram
 aiohttp
 fastapi-utils
 typing-inspect
+supabase
