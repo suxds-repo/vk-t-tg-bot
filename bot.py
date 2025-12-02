@@ -56,12 +56,15 @@ async def download_photo_bytes(url):
 
 def get_post_hash(post):
     text = post.get("text", "")
-    photos = []
+
+    photo_ids = []
     for att in post.get("attachments", []):
         if att["type"] == "photo":
-            largest = max(att["photo"]["sizes"], key=lambda s: s["width"])
-            photos.append(largest["url"])
-    return hashlib.md5((text + "".join(photos)).encode()).hexdigest()
+            photo_ids.append(str(att["photo"]["id"]))
+
+    raw = text + "|" + "|".join(sorted(photo_ids))
+    return hashlib.md5(raw.encode()).hexdigest()
+
 
 
 def is_post_new_or_changed(post):
@@ -225,6 +228,7 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
 
 
