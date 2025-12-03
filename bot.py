@@ -29,9 +29,10 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 def send_to_discord(text: str, photos: list[str]):
     embeds = []
 
-    if photos:
+    # Discord разрешает до 10 embeds
+    for url in photos[:10]:
         embeds.append({
-            "image": {"url": photos[0]}
+            "image": {"url": url}
         })
 
     payload = {
@@ -45,6 +46,7 @@ def send_to_discord(text: str, photos: list[str]):
         print("❌ Discord error:", r.text)
     else:
         print("✅ Discord sent")
+
 
 
 # ------------ SUPABASE ------------------
@@ -251,3 +253,4 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
