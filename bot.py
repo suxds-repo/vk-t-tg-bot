@@ -183,16 +183,32 @@ async def send_post_for_confirmation(post, app: Application):
     photos = extract_photo_urls(post)
     media = await make_media_group(text, photos)
 
+    # Красивое оформление текста
+    formatted_text = f"<b>📝 Новый пост с VK</b>\n"
+    if text:
+        formatted_text += f"{text}\n"
+    if photos:
+        formatted_text += f"<i>Фото: {len(photos)}</i>"
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Опубликовать ✅", callback_data=f"publish_{post['id']}"),
         InlineKeyboardButton("Пропустить ❌", callback_data=f"skip_{post['id']}")
     ]])
 
+    # Отправляем текстовое сообщение как первое в диалоге
+    message = await app.bot.send_message(
+        ADMIN_CHAT_ID,
+        formatted_text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+    # Если есть фото, отправляем их как медиа-альбом, без новых сообщений с текстом
     if media:
+        for m in media:
+            m.caption = None  # Чтобы текст не дублировался
         await app.bot.send_media_group(ADMIN_CHAT_ID, media)
-        await app.bot.send_message(ADMIN_CHAT_ID, "Опубликовать?", reply_markup=keyboard)
-    else:
-        await app.bot.send_message(ADMIN_CHAT_ID, text, reply_markup=keyboard)
+
 
 
 # ------------ CRON CHECKER ------------------
@@ -241,4 +257,5 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
