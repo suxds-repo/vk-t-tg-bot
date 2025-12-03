@@ -23,39 +23,36 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ------------ DISCORD ------------------
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-def send_to_discord(text: str, photos: list[str]):
-    embeds = []
 
-    # Discord разрешает до 10 embeds
-    for url in photos[:10]:
-        embeds.append({
-            "image": {"url": url}
-        })
+# ------------ GLOBALS ------------------
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+vk = vk_api.VkApi(token=VK_TOKEN)
+
+aiohttp_session: aiohttp.ClientSession | None = None
+
+
+async def get_session():
+    global aiohttp_session
+    if aiohttp_session is None:
+        aiohttp_session = aiohttp.ClientSession()
+    return aiohttp_session
+
+
+# ------------ DISCORD ------------------
+def send_to_discord(text: str, photos: list[str]):
+    embeds = [{"image": {"url": url}} for url in photos[:10]]
 
     payload = {
-        "content": text if text else "(без текста)",
+        "content": text or "(без текста)",
         "embeds": embeds
     }
 
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload)
-
-    if r.status_code >= 300:
-        print("❌ Discord error:", r.text)
-    else:
-        print("✅ Discord sent")
+    requests.post(DISCORD_WEBHOOK_URL, json=payload)
 
 
-
-# ------------ SUPABASE ------------------
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ------------ VK CLIENT -----------------
-vk = vk_api.VkApi(token=VK_TOKEN)
-
-# ------------ UTILS ---------------------
+# ------------ VK UTILS ------------------
 def should_post(post):
     if post.get("is_pinned") == 1:
         return False
@@ -74,31 +71,51 @@ def get_latest_valid_post():
     return None
 
 
-async def download_photo_bytes(url):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            return io.BytesIO(await resp.read())
-
-
+# ------------ HASHING ------------------
 def get_post_hash(post):
     text = post.get("text", "")
 
-    photo_ids = []
-    for att in post.get("attachments", []):
-        if att["type"] == "photo":
-            photo_ids.append(str(att["photo"]["id"]))
+    photo_ids = [
+        str(att["photo"]["id"])
+        for att in post.get("attachments", [])
+        if att["type"] == "photo"
+    ]
 
     raw = text + "|" + "|".join(sorted(photo_ids))
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+# ------------ PHOTOS / MEDIA ------------------
+def extract_photo_urls(post):
+    return [
+        max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
+        for att in post.get("attachments", [])
+        if att["type"] == "photo"
+    ]
+
+
+async def make_media_group(text, photos):
+    session = await get_session()
+    media = []
+
+    for i, url in enumerate(photos):
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            image = io.BytesIO(await resp.read())
+
+        caption = text[:1024] if i == 0 and text else None
+        media.append(InputMediaPhoto(image, caption=caption))
+
+    return media
+
+
+# ------------ SUPABASE LOGIC ------------------
 def is_post_new_or_changed(post):
     post_id = str(post["id"])
     new_hash = get_post_hash(post)
 
-    result = supabase.table("vk_posts_hashes").select("hash").eq("post_id", post_id).execute()
-    data = result.data
+    res = supabase.table("vk_posts_hashes").select("hash").eq("post_id", post_id).execute()
+    data = res.data
 
     if not data:
         supabase.table("vk_posts_hashes").insert({
@@ -108,6 +125,7 @@ def is_post_new_or_changed(post):
         return True
 
     old_hash = data[0]["hash"]
+
     if old_hash != new_hash:
         supabase.table("vk_posts_hashes").update({
             "hash": new_hash,
@@ -119,71 +137,51 @@ def is_post_new_or_changed(post):
 
 
 def save_post_to_db(post):
-    post_id = str(post["id"])
-    text = post.get("text", "")
-    photos = [
-        max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
-        for att in post.get("attachments", []) if att["type"] == "photo"
-    ]
-
     supabase.table("vk_posts").upsert({
-        "post_id": post_id,
-        "text": text,
-        "photos": photos,
+        "post_id": str(post["id"]),
+        "text": post.get("text", ""),
+        "photos": extract_photo_urls(post),
         "post_hash": get_post_hash(post)
     }).execute()
 
 
-# ------------------- CLEAN OLD POSTS ---------------------
+# ------------ CLEANERS ------------------
 MAX_POSTS = 20
-
-def clean_old_posts():
-    latest = supabase.table("vk_posts")\
-        .select("post_id")\
-        .order("updated_at", desc=True)\
-        .limit(MAX_POSTS)\
-        .execute()
-
-    keep_ids = [row["post_id"] for row in latest.data]
-
-    supabase.table("vk_posts")\
-        .delete()\
-        .not_.in_("post_id", keep_ids)\
-        .execute()
-
-
 MAX_HASHES = 20
 
-def clean_old_hashes():
-    latest = supabase.table("vk_posts_hashes")\
-        .select("post_id")\
-        .order("updated_at", desc=True)\
-        .limit(MAX_HASHES)\
+
+def clean_old(table, limit):
+    latest = (
+        supabase.table(table)
+        .select("post_id")
+        .order("updated_at", desc=True)
+        .limit(limit)
         .execute()
+    )
 
     keep_ids = [row["post_id"] for row in latest.data]
 
-    supabase.table("vk_posts_hashes")\
+    supabase.table(table)\
         .delete()\
         .not_.in_("post_id", keep_ids)\
         .execute()
 
 
-# ------------------- SEND TO ADMIN -----------------------
+def clean_old_posts():
+    clean_old("vk_posts", MAX_POSTS)
+
+
+def clean_old_hashes():
+    clean_old("vk_posts_hashes", MAX_HASHES)
+
+
+# ------------ ADMIN CONFIRMATION ------------------
 async def send_post_for_confirmation(post, app: Application):
     save_post_to_db(post)
 
     text = post.get("text", "")
-    photos = [
-        max(att["photo"]["sizes"], key=lambda s: s["width"])["url"]
-        for att in post.get("attachments", []) if att["type"] == "photo"
-    ]
-
-    media = []
-    for i, url in enumerate(photos):
-        photo_bytes = await download_photo_bytes(url)
-        caption = text[:1024] if i == 0 else None
-        media.append(InputMediaPhoto(photo_bytes, caption=caption))
+    photos = extract_photo_urls(post)
+    media = await make_media_group(text, photos)
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Опубликовать ✅", callback_data=f"publish_{post['id']}"),
@@ -197,16 +195,17 @@ async def send_post_for_confirmation(post, app: Application):
         await app.bot.send_message(ADMIN_CHAT_ID, text, reply_markup=keyboard)
 
 
-# ------------------- CRON CHECK --------------------------
+# ------------ CRON CHECKER ------------------
 async def check_vk_posts(app: Application):
     clean_old_posts()
     clean_old_hashes()
+
     post = get_latest_valid_post()
     if post and is_post_new_or_changed(post):
         await send_post_for_confirmation(post, app)
 
 
-# ------------------- CALLBACK -----------------------------
+# ------------ CALLBACK ------------------
 async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -214,43 +213,31 @@ async def button_callback(update: Update, context):
     action, post_id = query.data.split("_")
     post_id = str(post_id)
 
-    row = supabase.table("vk_posts").select("*").eq("post_id", post_id).single().execute()
-
-    if not row.data:
+    row = supabase.table("vk_posts").select("*").eq("post_id", post_id).single().execute().data
+    if not row:
         await query.edit_message_text("Не удалось найти пост в БД.")
         return
 
-    text = row.data.get("text")
-    photos = row.data.get("photos") or []
-
-    media = []
-    for i, url in enumerate(photos):
-        photo_bytes = await download_photo_bytes(url)
-        caption = text[:1024] if i == 0 else None
-        media.append(InputMediaPhoto(photo_bytes, caption=caption))
+    text = row.get("text")
+    photos = row.get("photos") or []
 
     if action == "publish":
-        # --- Telegram ---
+        media = await make_media_group(text, photos)
+
         if media:
             await context.bot.send_media_group(TG_CHANNEL, media)
         elif text:
             await context.bot.send_message(TG_CHANNEL, text)
 
-        # --- Discord ---
-        try:
-            send_to_discord(text, photos)
-        except Exception as e:
-            print("Discord send error:", e)
+        send_to_discord(text, photos)
 
         await query.edit_message_text("Пост опубликован!")
-
     else:
         await query.edit_message_text("Пост пропущен.")
 
 
-# ------------------- APP INIT -----------------------------
+# ------------ APP INIT ------------------
 def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
-
