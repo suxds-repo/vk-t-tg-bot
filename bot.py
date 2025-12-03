@@ -201,8 +201,7 @@ async def send_post_for_confirmation(post, app: Application):
     ]])
 
     if media:
-        await app.bot.send_media_group(ADMIN_CHAT_ID, media)
-        await app.bot.send_message(ADMIN_CHAT_ID, "Опубликовать?", reply_markup=keyboard)
+        await app.bot.send_media_group(ADMIN_CHAT_ID, media, reply_markup=keyboard)
     else:
         await app.bot.send_message(ADMIN_CHAT_ID, text, reply_markup=keyboard)
 
@@ -253,4 +252,5 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
 
