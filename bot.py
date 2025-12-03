@@ -2,6 +2,7 @@ import os
 import io
 import hashlib
 import aiohttp
+import requests
 import vk_api
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -21,6 +22,30 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# ------------ DISCORD ------------------
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
+def send_to_discord(text: str, photos: list[str]):
+    embeds = []
+
+    if photos:
+        embeds.append({
+            "image": {"url": photos[0]}
+        })
+
+    payload = {
+        "content": text if text else "(без текста)",
+        "embeds": embeds
+    }
+
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+
+    if r.status_code >= 300:
+        print("❌ Discord error:", r.text)
+    else:
+        print("✅ Discord sent")
+
 
 # ------------ SUPABASE ------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -66,17 +91,14 @@ def get_post_hash(post):
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-
 def is_post_new_or_changed(post):
     post_id = str(post["id"])
     new_hash = get_post_hash(post)
 
-    # SELECT
     result = supabase.table("vk_posts_hashes").select("hash").eq("post_id", post_id).execute()
     data = result.data
 
     if not data:
-        # INSERT
         supabase.table("vk_posts_hashes").insert({
             "post_id": post_id,
             "hash": new_hash
@@ -85,7 +107,6 @@ def is_post_new_or_changed(post):
 
     old_hash = data[0]["hash"]
     if old_hash != new_hash:
-        # UPDATE
         supabase.table("vk_posts_hashes").update({
             "hash": new_hash,
             "updated_at": "now()"
@@ -95,7 +116,6 @@ def is_post_new_or_changed(post):
     return False
 
 
-# ------------------- SAVE POST --------------------------
 def save_post_to_db(post):
     post_id = str(post["id"])
     text = post.get("text", "")
@@ -108,16 +128,14 @@ def save_post_to_db(post):
         "post_id": post_id,
         "text": text,
         "photos": photos,
-        "post_hash": get_post_hash(post)   # ← ДОБАВЛЕНО
+        "post_hash": get_post_hash(post)
     }).execute()
-
 
 
 # ------------------- CLEAN OLD POSTS ---------------------
 MAX_POSTS = 20
 
 def clean_old_posts():
-    # Получаем последние 20 id
     latest = supabase.table("vk_posts")\
         .select("post_id")\
         .order("updated_at", desc=True)\
@@ -126,16 +144,15 @@ def clean_old_posts():
 
     keep_ids = [row["post_id"] for row in latest.data]
 
-    # Удаляем остальные
     supabase.table("vk_posts")\
         .delete()\
         .not_.in_("post_id", keep_ids)\
         .execute()
 
+
 MAX_HASHES = 20
 
 def clean_old_hashes():
-    # Получаем последние 20 хешей
     latest = supabase.table("vk_posts_hashes")\
         .select("post_id")\
         .order("updated_at", desc=True)\
@@ -144,8 +161,6 @@ def clean_old_hashes():
 
     keep_ids = [row["post_id"] for row in latest.data]
 
-
-    # Удаляем остальные
     supabase.table("vk_posts_hashes")\
         .delete()\
         .not_.in_("post_id", keep_ids)\
@@ -197,7 +212,6 @@ async def button_callback(update: Update, context):
     action, post_id = query.data.split("_")
     post_id = str(post_id)
 
-    # SELECT
     row = supabase.table("vk_posts").select("*").eq("post_id", post_id).single().execute()
 
     if not row.data:
@@ -214,11 +228,20 @@ async def button_callback(update: Update, context):
         media.append(InputMediaPhoto(photo_bytes, caption=caption))
 
     if action == "publish":
+        # --- Telegram ---
         if media:
             await context.bot.send_media_group(TG_CHANNEL, media)
         elif text:
             await context.bot.send_message(TG_CHANNEL, text)
+
+        # --- Discord ---
+        try:
+            send_to_discord(text, photos)
+        except Exception as e:
+            print("Discord send error:", e)
+
         await query.edit_message_text("Пост опубликован!")
+
     else:
         await query.edit_message_text("Пост пропущен.")
 
@@ -228,8 +251,3 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
-
-
-
-
-
