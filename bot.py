@@ -45,7 +45,7 @@ def send_to_discord(text: str, photos: list[str]):
     embeds = [{"image": {"url": url}} for url in photos[:10]]
 
     payload = {
-        "content": text or "(без текста)",
+        "content": f"@everyone\n{text}" if text else "",
         "embeds": embeds
     }
 
@@ -241,3 +241,4 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
