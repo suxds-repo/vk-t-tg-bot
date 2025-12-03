@@ -42,14 +42,26 @@ async def get_session():
 
 # ------------ DISCORD ------------------
 def send_to_discord(text: str, photos: list[str]):
-    embeds = [{"image": {"url": url}} for url in photos[:10]]
+    import mimetypes
 
-    payload = {
-        "content": f"@everyone\n{text}" if text else "",
-        "embeds": embeds
-    }
+    # Начинаем контент с @everyone
+    content = f"@everyone\n{text}" if text else "@everyone"
 
-    requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    if not photos:
+        # Если картинок нет, просто отправляем текст
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+        return
+
+    # Отправка файлов
+    files = {}
+    for i, url in enumerate(photos[:10]):  # до 10 файлов
+        response = requests.get(url)
+        response.raise_for_status()
+        ext = mimetypes.guess_extension(response.headers.get('Content-Type', 'image/png')) or ".png"
+        files[f"file{i}"] = (f"image{i}{ext}", response.content)
+
+    requests.post(DISCORD_WEBHOOK_URL, data={"content": content}, files=files)
+
 
 
 # ------------ VK UTILS ------------------
@@ -241,3 +253,4 @@ def get_telegram_app():
     app = Application.builder().token(TG_BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
+
