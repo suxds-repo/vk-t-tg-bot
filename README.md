@@ -45,7 +45,7 @@
 Клонируем репозиторий:
 
 ```cmd
-git clone https://github.com/yourusername/vk-tg-autoposter.git
+git clone https://github.com/suxds-repo/vk-t-tg-bot.git
 cd vk-tg-autoposter
 ```
 
