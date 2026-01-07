@@ -46,7 +46,7 @@
 
 ```cmd
 git clone https://github.com/suxds-repo/vk-t-tg-bot.git
-cd vk-tg-autoposter
+cd vk-t-tg-bot
 ```
 
 
